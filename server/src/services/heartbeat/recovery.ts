@@ -118,6 +118,7 @@ import { releaseRuntimeServicesForRun } from "../workspace-runtime.js";
 import { isProcessGroupAlive } from "../local-service-supervisor.js";
 import {
   findMissingHotRestartSnapshotRunIds,
+  quarantineHotRestartIntent,
   readHotRestartIntent,
   removeHotRestartIntent,
   shouldHonorHotRestartIntentForProcess,
@@ -508,6 +509,23 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     );
   }
 
+  /**
+   * The run list the shutdown snapshot is enriched with. Kept behind one
+   * function so the caller can isolate exactly this read: a closed connection
+   * here must degrade the snapshot, not abort preparation.
+   */
+  function readRunningRunsForRestart() {
+    return db
+      .select({
+        run: heartbeatRuns,
+        adapterType: agents.adapterType,
+        adapterConfig: agents.adapterConfig,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(eq(heartbeatRuns.status, "running"));
+  }
+
   async function prepareHotRestartShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
@@ -523,14 +541,18 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     try {
       intent = await readHotRestartIntent();
     } catch (err) {
-      logger.warn(
+      logger.error(
         { err },
-        "failed to read hot-restart intent; falling back to normal shutdown drain",
+        "failed to read hot-restart intent; shutdown will fail closed if an intent is pending on disk",
       );
+      // A failure verdict, not a drain decision: the coordinator still asks the
+      // disk probe, and a pending intent there keeps the graceful drain
+      // unreachable. Adoption quarantines a corrupt file so this cannot repeat.
       return {
         mode: "read_error" as const,
         skipDrain: false as const,
         activeRunIds: [] as string[],
+        preparationFailed: true as const,
       };
     }
 
@@ -558,32 +580,70 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       };
     }
 
-    const activeRuns = await db
-      .select({
-        run: heartbeatRuns,
-        adapterType: agents.adapterType,
-        adapterConfig: agents.adapterConfig,
-      })
-      .from(heartbeatRuns)
-      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(eq(heartbeatRuns.status, "running"));
-    abort?.throwIfAborted();
-    const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
     const intentWithVersion = {
       ...intent,
       previousServerVersion: intent.previousServerVersion ?? serverVersion,
     };
+    // Fail-closed invariant (PZUA-270): once the intent is honored, a readable
+    // database is an enrichment, never a precondition. Persist what is knowable
+    // without the DB first (intent as read, signal, pid, timestamp, empty run
+    // list) so a dead database still leaves an adoption snapshot on disk.
+    const degradedReasons = new Set<string>();
+    const writeSnapshot = async (input: {
+      activeRuns: HotRestartIntentRun[];
+      activeRunsCaptured: boolean;
+      drainReason?: "active_acp_run";
+      drainRunIds?: string[];
+    }) => {
+      try {
+        await writeHotRestartShutdownSnapshot({
+          intent: intentWithVersion,
+          signal,
+          activeRuns: input.activeRuns,
+          activeRunsCaptured: input.activeRunsCaptured,
+          ...(input.drainReason
+            ? { drainReason: input.drainReason, drainRunIds: input.drainRunIds }
+            : {}),
+          capturedAt: now,
+        });
+        return true;
+      } catch (err) {
+        degradedReasons.add("snapshot_write_failed");
+        logger.error({ err, signal }, "hot-restart shutdown could not write the adoption snapshot");
+        return false;
+      }
+    };
 
-    const serverStdioRuns = activeRuns.filter(isServerStdioBoundHotRestartRun);
+    await writeSnapshot({ activeRuns: [], activeRunsCaptured: false });
+
+    let activeRuns: Awaited<ReturnType<typeof readRunningRunsForRestart>> | null = null;
+    try {
+      activeRuns = await readRunningRunsForRestart();
+    } catch (err) {
+      // A closed connection here used to abort preparation and hand control to
+      // the graceful drain, which SIGTERMs every live run. Record why the run
+      // list is unknown and keep the already-written snapshot.
+      degradedReasons.add("run_list_unavailable");
+      logger.error(
+        { err, signal, previousServerPid: intent.previousServerPid },
+        "hot-restart shutdown could not read running runs; leaving live children alive and skipping the drain",
+      );
+    }
+    abort?.throwIfAborted();
+
+    const snapshotRuns = (activeRuns ?? []).map(toHotRestartIntentRun);
+
+    // The ACP/server-stdio decision needs a successful run-list read: without
+    // one we cannot know whether such a run exists, and guessing "no" would
+    // adopt a child the new server cannot drive. Stay fail-closed instead.
+    const serverStdioRuns = (activeRuns ?? []).filter(isServerStdioBoundHotRestartRun);
     if (serverStdioRuns.length > 0) {
       const activeServerStdioRunIds = serverStdioRuns.map(({ run }) => run.id);
-      await writeHotRestartShutdownSnapshot({
-        intent: intentWithVersion,
-        signal,
+      await writeSnapshot({
         activeRuns: snapshotRuns,
+        activeRunsCaptured: true,
         drainReason: "active_acp_run",
         drainRunIds: activeServerStdioRunIds,
-        capturedAt: now,
       });
 
       logger.warn(
@@ -607,31 +667,39 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       };
     }
 
-    await writeHotRestartShutdownSnapshot({
-      intent: intentWithVersion,
-      signal,
-      activeRuns: snapshotRuns,
-      capturedAt: now,
-    });
-    for (const { run } of activeRuns) {
-      abort?.throwIfAborted();
-      await appendRunEvent(run, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "info",
-        message:
-          "Hot restart requested; leaving child process alive for startup adoption",
-        payload: {
-          signal,
-          previousServerPid: intent.previousServerPid,
-          previousServerVersion: intentWithVersion.previousServerVersion,
-          processPid: run.processPid ?? null,
-          processGroupId: run.processGroupId ?? null,
-        },
-      });
+    if (activeRuns) {
+      await writeSnapshot({ activeRuns: snapshotRuns, activeRunsCaptured: true });
     }
 
-    const nativeRunIds = activeRuns
+    for (const { run } of activeRuns ?? []) {
+      abort?.throwIfAborted();
+      try {
+        await appendRunEvent(run, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "info",
+          message:
+            "Hot restart requested; leaving child process alive for startup adoption",
+          payload: {
+            signal,
+            previousServerPid: intent.previousServerPid,
+            previousServerVersion: intentWithVersion.previousServerVersion,
+            processPid: run.processPid ?? null,
+            processGroupId: run.processGroupId ?? null,
+          },
+        });
+      } catch (err) {
+        // A missing run-log row is not a reason to hand the process tree to the
+        // drain; log it and keep the snapshot as the source of truth.
+        degradedReasons.add("run_event_append_failed");
+        logger.warn(
+          { err, signal, runId: run.id },
+          "hot-restart shutdown could not append the leave-alive run event",
+        );
+      }
+    }
+
+    const nativeRunIds = (activeRuns ?? [])
       .filter(
         ({ run, adapterType }) =>
           adapterType === "paperclip_runner" &&
@@ -643,20 +711,27 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     const detachedNativeSessions =
       await detachNativeSessionsForRestart(nativeRunIds);
 
-    logger.info(
-      {
-        signal,
-        previousServerPid: intent.previousServerPid,
-        activeRunIds: snapshotRuns.map((run) => run.runId),
-        detachedNativeSessions,
-      },
-      "hot-restart shutdown snapshot captured; skipping graceful run drain",
-    );
+    const mode = degradedReasons.size > 0
+      ? ("hot_restart_degraded" as const)
+      : ("hot_restart" as const);
+    const logContext = {
+      signal,
+      previousServerPid: intent.previousServerPid,
+      activeRunIds: snapshotRuns.map((run) => run.runId),
+      detachedNativeSessions,
+      degradedReasons: [...degradedReasons],
+    };
+    if (mode === "hot_restart_degraded") {
+      logger.warn(logContext, "hot-restart shutdown snapshot degraded; still skipping graceful run drain");
+    } else {
+      logger.info(logContext, "hot-restart shutdown snapshot captured; skipping graceful run drain");
+    }
 
     return {
-      mode: "hot_restart" as const,
+      mode,
       skipDrain: true as const,
       activeRunIds: snapshotRuns.map((run) => run.runId),
+      ...(degradedReasons.size > 0 ? { degradedReasons: [...degradedReasons] } : {}),
     };
   }
 
@@ -665,9 +740,20 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     try {
       intent = await readHotRestartIntent();
     } catch (err) {
-      logger.warn(
-        { err },
-        "failed to read hot-restart intent on startup; skipping adoption",
+      // An unreadable intent makes shutdown fail closed, so it must not stay on
+      // disk: quarantine it (bytes preserved for inspection) instead of letting
+      // it suppress the graceful drain on every future shutdown. Deliberately no
+      // report — nothing is known about what was running.
+      const quarantinedPath = await quarantineHotRestartIntent().catch((renameError) => {
+        logger.error(
+          { err: renameError },
+          "failed to quarantine the unreadable hot-restart intent; shutdown will keep failing closed",
+        );
+        return null;
+      });
+      logger.error(
+        { err, quarantinedPath },
+        "hot-restart intent unreadable on startup; quarantined it and skipped adoption",
       );
       return {
         mode: "read_error" as const,
@@ -699,11 +785,60 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         },
         intent.drainRequired
           ? "drain-required restart intent has no adoption snapshot"
-          : "hot-restart intent present but shutdown snapshot is missing; no runs can be adopted",
+          : "hot-restart intent present but shutdown snapshot is missing; classifying currently running runs",
       );
     }
-    const candidates = intent.shutdownSnapshot?.activeRuns ?? [];
-    const missingSnapshotRunIds = findMissingHotRestartSnapshotRunIds(intent);
+    const snapshot = intent.shutdownSnapshot;
+    // `activeRunsCaptured:false` is the previous server saying "I could not
+    // look". A snapshot that is missing altogether is a different case: the
+    // write failed after a successful read, so the preflight run list is still
+    // the best evidence and those runs are reported as lost below rather than
+    // adopted on the strength of a row we never snapshotted.
+    const runListNotCaptured = snapshot?.activeRunsCaptured === false;
+    let candidates: HotRestartIntentRun[] = snapshot?.activeRuns ?? [];
+    if (runListNotCaptured) {
+      // The previous server could not read its run list (its database was
+      // already gone when the snapshot was written, or the snapshot write
+      // failed). An empty list therefore means "unknown", not "nothing was
+      // running": recover the affected runs from the database so adoption
+      // reports them (`missing_process_metadata` / `lost`) instead of claiming
+      // a clean empty report.
+      try {
+        candidates = (await readRunningRunsForRestart()).map(toHotRestartIntentRun);
+        logger.warn(
+          {
+            previousServerPid: intent.previousServerPid,
+            recoveredRunIds: candidates.map((run) => run.runId),
+          },
+          "hot-restart snapshot has no captured run list; classifying currently running runs",
+        );
+      } catch (err) {
+        // Writing an empty report here and deleting the intent would be the
+        // exact false all-clear this whole change exists to prevent, and this is
+        // the most likely follow-up to the drill (embedded Postgres still down
+        // when the new server boots). Leave the intent in place; the orphan
+        // reaper is the backstop for this boot and the next boot retries
+        // adoption.
+        logger.error(
+          { err, previousServerPid: intent.previousServerPid },
+          "hot-restart snapshot has no captured run list and the run table is unreadable; deferring adoption and keeping the intent",
+        );
+        return {
+          mode: "deferred" as const,
+          deferredReason: "run_table_unreadable" as const,
+          adoptedRunIds: [] as string[],
+          finalizedWhileDownRunIds: [] as string[],
+          lostRunIds: [] as string[],
+          skippedRunIds: [] as string[],
+        };
+      }
+    }
+    // A preflight run the snapshot does not account for is reported as lost —
+    // unless it is already one of the recovered candidates, which would report
+    // the same run twice.
+    const candidateRunIds = new Set(candidates.map((run) => run.runId));
+    const missingSnapshotRunIds = findMissingHotRestartSnapshotRunIds(intent)
+      .filter((runId) => !candidateRunIds.has(runId));
     const reconciliationRunIds = [
       ...new Set([
         ...candidates.map((run) => run.runId),

@@ -1,5 +1,13 @@
 type HotRestartShutdownPreparation = {
   skipDrain: boolean;
+  /**
+   * True when preparation could not decide (e.g. the intent file was
+   * unreadable). A *failure verdict* differs from a deliberate drain verdict
+   * (`drain_required`, `pid_mismatch`, `not_requested`, and the release
+   * lineage's explicit ACP drain): only failure verdicts are escalated to the
+   * disk probe, so an intentional drain still drains.
+   */
+  preparationFailed?: boolean;
 };
 
 type ShutdownLogger = {
@@ -325,18 +333,42 @@ export async function loadWithoutCoordinatedShutdownSignalHooks<T>(
   return loaded;
 }
 
+/**
+ * Coordinate scheduler shutdown with a possible hot restart.
+ *
+ * Fail-closed invariant: when a hot-restart intent is pending for this process,
+ * the graceful run drain is forbidden. `skipDrain` therefore survives a
+ * preparation failure — "we could not read the run list / the intent" means "we
+ * do not know what is running", never "drain everything". The caller still skips
+ * the drain when `failClosed` is true.
+ *
+ * Deliberate drain verdicts are *not* escalated: the release lineage's ACP path
+ * returns `skipDrain:false` on purpose after a successful run-list read, and
+ * trusting the probe over it would leave those children alive and unadopted.
+ */
 export async function coordinateHeartbeatSchedulerShutdown<
   TPreparation extends HotRestartShutdownPreparation,
 >(input: {
   signal: "SIGINT" | "SIGTERM";
   prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<TPreparation>) | null;
   waitForHeartbeatSchedulerIdle: () => Promise<void>;
+  /**
+   * Disk-only probe answering "is a hot restart pending for this process?".
+   * It must not depend on the database, because the interesting failure is a
+   * database that is already gone. Defaults to "not pending" so callers that
+   * do not care keep the classic graceful path.
+   */
+  isHotRestartShutdownPending?: () => Promise<boolean>;
 }): Promise<{
   hotRestart: TPreparation | null;
   preparationError: unknown;
+  preparationFailed: boolean;
   waitedForSchedulerIdle: boolean;
+  failClosed: boolean;
 }> {
   let hotRestart: TPreparation | null = null;
+  // Track the throw explicitly: `throw undefined` must still count as a failure.
+  let preparationFailed = false;
   let preparationError: unknown = null;
 
   // The signal handler stops the scheduler before entering this coordinator.
@@ -348,16 +380,49 @@ export async function coordinateHeartbeatSchedulerShutdown<
   if (input.prepareHotRestartShutdown) {
     try {
       hotRestart = await input.prepareHotRestartShutdown(input.signal);
+      preparationFailed = hotRestart?.preparationFailed === true;
     } catch (err) {
+      preparationFailed = true;
       preparationError = err;
+    }
+  }
+
+  if (preparationFailed && input.isHotRestartShutdownPending) {
+    const pending = await input.isHotRestartShutdownPending().catch(() => true);
+    if (pending) {
+      // The intent says drainRequired:false and targets this pid, but preparation
+      // could not decide. Keep children alive and never reach the drain.
+      return {
+        hotRestart,
+        preparationError,
+        preparationFailed,
+        waitedForSchedulerIdle: true,
+        failClosed: true,
+      };
     }
   }
 
   return {
     hotRestart,
     preparationError,
+    preparationFailed,
     waitedForSchedulerIdle: true,
+    failClosed: false,
   };
+}
+
+/**
+ * The single place that turns a coordination verdict into "do not drain".
+ *
+ * Extracted so the `index.ts` shutdown path has coverage: this predicate (not
+ * the coordinator) is what actually keeps `drainHeartbeatRunsForShutdown`
+ * unreachable.
+ */
+export function shouldSkipHeartbeatRunDrain(result: {
+  hotRestart: { skipDrain: boolean } | null;
+  failClosed: boolean;
+}) {
+  return result.failClosed || result.hotRestart?.skipDrain === true;
 }
 
 export async function finishServiceShutdown(

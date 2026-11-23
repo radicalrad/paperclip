@@ -9,6 +9,7 @@ import {
   finishServiceShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
   runBoundedShutdownStep,
+  shouldSkipHeartbeatRunDrain,
 } from "./shutdown.js";
 
 function deferred<T = void>() {
@@ -596,7 +597,9 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
     expect(result).toEqual({
       hotRestart: { mode: "prepared", skipDrain: true },
       preparationError: null,
+      preparationFailed: false,
       waitedForSchedulerIdle: true,
+      failClosed: false,
     });
   });
 
@@ -621,7 +624,9 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
         drainRunIds: ["acp-run"],
       },
       preparationError: null,
+      preparationFailed: false,
       waitedForSchedulerIdle: true,
+      failClosed: false,
     });
   });
 
@@ -652,7 +657,9 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
     await expect(shutdown).resolves.toEqual({
       hotRestart: { mode: "not_requested", skipDrain: false },
       preparationError: null,
+      preparationFailed: false,
       waitedForSchedulerIdle: true,
+      failClosed: false,
     });
   });
 
@@ -669,7 +676,9 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
     expect(result).toEqual({
       hotRestart: null,
       preparationError: null,
+      preparationFailed: false,
       waitedForSchedulerIdle: true,
+      failClosed: false,
     });
   });
 
@@ -689,8 +698,156 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
     expect(result).toEqual({
       hotRestart: null,
       preparationError,
+      preparationFailed: true,
       waitedForSchedulerIdle: true,
+      // No disk probe supplied: the classic graceful path is preserved.
+      failClosed: false,
     });
+    expect(shouldSkipHeartbeatRunDrain(result)).toBe(false);
+  });
+
+  it("fails closed when preparation throws while an intent is pending", async () => {
+    const preparationError = new Error("write CONNECTION_CLOSED 127.0.0.1:54329");
+
+    const result = await coordinateHeartbeatSchedulerShutdown({
+      signal: "SIGTERM",
+      prepareHotRestartShutdown: vi.fn(async () => {
+        throw preparationError;
+      }),
+      waitForHeartbeatSchedulerIdle: vi.fn(async () => undefined),
+      isHotRestartShutdownPending: vi.fn(async () => true),
+    });
+
+    expect(result.hotRestart).toBeNull();
+    expect(result.preparationError).toBe(preparationError);
+    expect(result.preparationFailed).toBe(true);
+    expect(result.failClosed).toBe(true);
+    expect(shouldSkipHeartbeatRunDrain(result)).toBe(true);
+  });
+
+  it("treats `throw undefined` as a preparation failure instead of releasing the drain", async () => {
+    const result = await coordinateHeartbeatSchedulerShutdown({
+      signal: "SIGTERM",
+      prepareHotRestartShutdown: vi.fn(async () => {
+        // eslint-disable-next-line no-throw-literal
+        throw undefined;
+      }),
+      waitForHeartbeatSchedulerIdle: vi.fn(async () => undefined),
+      isHotRestartShutdownPending: vi.fn(async () => true),
+    });
+
+    expect(result.preparationError).toBeUndefined();
+    expect(result.preparationFailed).toBe(true);
+    expect(result.failClosed).toBe(true);
+    expect(shouldSkipHeartbeatRunDrain(result)).toBe(true);
+  });
+
+  it("fails closed when the pending-intent probe itself throws", async () => {
+    const result = await coordinateHeartbeatSchedulerShutdown({
+      signal: "SIGINT",
+      prepareHotRestartShutdown: vi.fn(async () => {
+        throw new Error("snapshot failed");
+      }),
+      waitForHeartbeatSchedulerIdle: vi.fn(async () => undefined),
+      isHotRestartShutdownPending: vi.fn(async () => {
+        throw new Error("hot-restart intent unreadable");
+      }),
+    });
+
+    expect(result.failClosed).toBe(true);
+    expect(shouldSkipHeartbeatRunDrain(result)).toBe(true);
+  });
+
+  it("fails closed on a failure verdict (read_error) even though preparation returned a drain", async () => {
+    // `readHotRestartIntent` can fail inside preparation, which then reports
+    // `read_error` with skipDrain:false and `preparationFailed:true`. The disk
+    // probe owns the intent question, so the drain stays unreachable.
+    const result = await coordinateHeartbeatSchedulerShutdown({
+      signal: "SIGTERM",
+      prepareHotRestartShutdown: vi.fn(async () => ({
+        mode: "read_error" as const,
+        skipDrain: false,
+        preparationFailed: true as const,
+      })),
+      waitForHeartbeatSchedulerIdle: vi.fn(async () => undefined),
+      isHotRestartShutdownPending: vi.fn(async () => true),
+    });
+
+    expect(result.hotRestart).toMatchObject({ mode: "read_error" });
+    expect(result.failClosed).toBe(true);
+    expect(shouldSkipHeartbeatRunDrain(result)).toBe(true);
+  });
+
+  it("honours a deliberate drain verdict even when an intent is pending on disk", async () => {
+    // The release lineage's ACP path (and `drain_required`) chooses the drain on
+    // purpose after a successful run-list read. A probe that says "intent
+    // pending" must not override that decision, or those children would be left
+    // alive and unadopted.
+    const result = await coordinateHeartbeatSchedulerShutdown({
+      signal: "SIGTERM",
+      prepareHotRestartShutdown: vi.fn(async () => ({
+        mode: "acp_drain_required" as const,
+        skipDrain: false,
+      })),
+      waitForHeartbeatSchedulerIdle: vi.fn(async () => undefined),
+      isHotRestartShutdownPending: vi.fn(async () => true),
+    });
+
+    expect(result.preparationFailed).toBe(false);
+    expect(result.failClosed).toBe(false);
+    expect(shouldSkipHeartbeatRunDrain(result)).toBe(false);
+  });
+
+  it("still drains when preparation declines the hot restart and no intent is pending", async () => {
+    const result = await coordinateHeartbeatSchedulerShutdown({
+      signal: "SIGTERM",
+      prepareHotRestartShutdown: vi.fn(async () => ({
+        mode: "drain_required" as const,
+        skipDrain: false,
+      })),
+      waitForHeartbeatSchedulerIdle: vi.fn(async () => undefined),
+      isHotRestartShutdownPending: vi.fn(async () => false),
+    });
+
+    expect(result.failClosed).toBe(false);
+    expect(shouldSkipHeartbeatRunDrain(result)).toBe(false);
+  });
+});
+
+describe("shouldSkipHeartbeatRunDrain", () => {
+  it("skips the drain for a skipDrain verdict", () => {
+    expect(shouldSkipHeartbeatRunDrain({
+      hotRestart: { skipDrain: true },
+      failClosed: false,
+    })).toBe(true);
+  });
+
+  it("skips the drain when the coordinator failed closed", () => {
+    expect(shouldSkipHeartbeatRunDrain({
+      hotRestart: null,
+      failClosed: true,
+    })).toBe(true);
+  });
+
+  it("skips the drain when preparation returned skipDrain:false but the coordinator failed closed", () => {
+    expect(shouldSkipHeartbeatRunDrain({
+      hotRestart: { skipDrain: false },
+      failClosed: true,
+    })).toBe(true);
+  });
+
+  it("drains for a deliberate drain verdict", () => {
+    expect(shouldSkipHeartbeatRunDrain({
+      hotRestart: { skipDrain: false },
+      failClosed: false,
+    })).toBe(false);
+  });
+
+  it("drains when there is no preparation result at all", () => {
+    expect(shouldSkipHeartbeatRunDrain({
+      hotRestart: null,
+      failClosed: false,
+    })).toBe(false);
   });
 });
 

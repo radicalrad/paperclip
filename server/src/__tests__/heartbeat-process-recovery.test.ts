@@ -283,12 +283,16 @@ import {
 } from "../vendor/paperclip-runner/testing.js";
 import { recoveryService } from "../services/recovery/service.ts";
 import {
+  isHotRestartShutdownPending,
   readHotRestartIntent,
   readProcessStartedAt,
+  resolveHotRestartIntentPath,
   resolveLegacyHotRestartIntentPath,
   resolveHotRestartReportPath,
   writeHotRestartIntent,
+  writeHotRestartShutdownSnapshot,
 } from "../services/hot-restart.ts";
+import { coordinateHeartbeatSchedulerShutdown } from "../shutdown.ts";
 import { secretService } from "../services/secrets.ts";
 import {
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
@@ -4547,6 +4551,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(intent?.shutdownSnapshot).toMatchObject({
         capturedAt: "2026-03-19T00:06:00.000Z",
         signal: "SIGTERM",
+        activeRunsCaptured: true,
         activeRuns: [
           {
             runId,
@@ -4556,6 +4561,366 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           },
         ],
       });
+    });
+  });
+
+  /**
+   * Wraps the test database so one operation on one table fails the way a dead
+   * embedded Postgres fails: `write CONNECTION_CLOSED 127.0.0.1:54329` when the
+   * query is awaited. Everything else keeps working, which lets a test place
+   * the failure at one exact call site.
+   */
+  /**
+   * Renders a drizzle `sql` template to text so a test can target one statement
+   * shape (the run-event append is a single CTE `execute`, not an `insert`).
+   */
+  function sqlText(query: unknown): string {
+    const chunks = (query as { queryChunks?: unknown[] } | null)?.queryChunks;
+    if (!Array.isArray(chunks)) return "";
+    return chunks.map((chunk) => {
+      if (typeof chunk === "string") return chunk;
+      const value = (chunk as { value?: unknown })?.value;
+      return Array.isArray(value) ? value.join("") : "";
+    }).join(" ");
+  }
+
+  function dbFailingOn(
+    source: ReturnType<typeof createDb>,
+    input: { op: "select" | "insert"; table: unknown; sqlTable?: string },
+  ): ReturnType<typeof createDb> {
+    const fail = () => Promise.reject(Object.assign(
+      new Error("write CONNECTION_CLOSED 127.0.0.1:54329"),
+      { code: "CONNECTION_CLOSED" },
+    ));
+    const failWhenAwaited = (builder: object) => new Proxy(builder, {
+      get(target, prop) {
+        if (prop === "then") {
+          return (resolve: (value: unknown) => unknown, reject: (reason: unknown) => unknown) =>
+            fail().then(resolve, reject);
+        }
+        const value = Reflect.get(target, prop);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => failWhenAwaited(value.apply(target, args));
+      },
+    });
+
+    // The production writers reach the run-event table through `db.execute(sql)`
+    // and `db.transaction(...)`, so both the raw statement and the transaction
+    // handle have to be wrapped; otherwise the injected failure never fires.
+    const wrap = (target: any): any => new Proxy(target, {
+      get(handle, prop) {
+        const value = Reflect.get(handle, prop);
+        if (typeof value !== "function") return value;
+        if (prop === "transaction") {
+          return (...args: unknown[]) => value.apply(handle, args.map((arg) =>
+            typeof arg === "function"
+              ? (tx: unknown, ...rest: unknown[]) => (arg as (...a: unknown[]) => unknown)(wrap(tx), ...rest)
+              : arg));
+        }
+        if (prop === "execute" && input.sqlTable) {
+          return (query: unknown, ...rest: unknown[]) =>
+            sqlText(query).includes(input.sqlTable as string)
+              ? fail()
+              : value.apply(handle, [query, ...rest]);
+        }
+        if (prop !== input.op) return value.bind(handle);
+        return (...args: unknown[]) => {
+          const builder = value.apply(handle, args) as object;
+          if (input.op === "insert") {
+            return args[0] === input.table ? failWhenAwaited(builder) : builder;
+          }
+          return new Proxy(builder, {
+            get(innerTarget, innerProp) {
+              const innerValue = Reflect.get(innerTarget, innerProp);
+              if (typeof innerValue !== "function") return innerValue;
+              return (...innerArgs: unknown[]) => {
+                const result = innerValue.apply(innerTarget, innerArgs) as object;
+                if (innerProp === "from" && innerArgs[0] === input.table) {
+                  return failWhenAwaited(result);
+                }
+                return result;
+              };
+            },
+          });
+        };
+      },
+    });
+
+    return wrap(source) as ReturnType<typeof createDb>;
+  }
+
+  it("fails closed when the run-list select dies with a closed connection", async () => {
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: null,
+      processGroupId: null,
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+      const heartbeat = heartbeatService(dbFailingOn(db, { op: "select", table: heartbeatRuns }));
+
+      const result = await heartbeat.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(result).toEqual({
+        mode: "hot_restart_degraded",
+        skipDrain: true,
+        activeRunIds: [],
+        degradedReasons: ["run_list_unavailable"],
+      });
+      const intent = await readHotRestartIntent();
+      expect(intent?.shutdownSnapshot).toMatchObject({
+        capturedAt: "2026-03-19T00:06:00.000Z",
+        signal: "SIGTERM",
+        activeRuns: [],
+        activeRunsCaptured: false,
+      });
+      const run = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(run).toEqual({ status: "running", errorCode: null });
+    });
+  });
+
+  it("fails closed when the leave-alive run event cannot be appended", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      // A detached CLI child is adoptable, so the run never takes the ACP drain
+      // path and the only failure under test is the run-event append.
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+      const heartbeat = heartbeatService(
+        dbFailingOn(db, {
+          op: "insert",
+          table: heartbeatRunEvents,
+          sqlTable: "heartbeat_run_events",
+        }),
+      );
+
+      const result = await heartbeat.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(result).toEqual({
+        mode: "hot_restart_degraded",
+        skipDrain: true,
+        activeRunIds: [runId],
+        degradedReasons: ["run_event_append_failed"],
+      });
+      // The snapshot is written before the run event, so the failed append
+      // cannot truncate it.
+      const intent = await readHotRestartIntent();
+      expect(intent?.shutdownSnapshot).toMatchObject({
+        capturedAt: "2026-03-19T00:06:00.000Z",
+        signal: "SIGTERM",
+        activeRunsCaptured: true,
+        activeRuns: [{ runId, processPid: child.pid }],
+      });
+      // Only the fixture's own seq 1: the leave-alive event was never written.
+      const events = await db
+        .select({ seq: heartbeatRunEvents.seq })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId));
+      expect(events.map((event) => event.seq)).toEqual([1]);
+      expect(isPidAlive(child.pid)).toBe(true);
+    });
+  });
+
+  it("leaves the drain-required path untouched: no snapshot, no run events", async () => {
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: null,
+      processGroupId: null,
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+        drainRequired: true,
+      });
+
+      const heartbeat = heartbeatService(db);
+      const preparation = await heartbeat.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(preparation).toEqual({
+        mode: "drain_required",
+        skipDrain: false,
+        activeRunIds: [],
+      });
+      // The early return must stay above the snapshot writes: a drain-required
+      // restart keeps the classic path, and a snapshot here would make the next
+      // boot adopt runs the drain had already terminated.
+      const intent = await readHotRestartIntent();
+      expect(intent?.shutdownSnapshot).toBeUndefined();
+      const events = await db
+        .select({ seq: heartbeatRunEvents.seq })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId));
+      // Only the fixture's own seq 1: no leave-alive event was appended.
+      expect(events.map((event) => event.seq)).toEqual([1]);
+    });
+  });
+
+  it("reports an unreadable intent as a failure verdict instead of a drain decision", async () => {
+    await withTempPaperclipHome(async (home) => {
+      const intentPath = resolveHotRestartIntentPath(home);
+      await fs.mkdir(path.dirname(intentPath), { recursive: true });
+      await fs.writeFile(intentPath, "{ not json", "utf8");
+
+      const preparation = await heartbeatService(db).prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(preparation).toMatchObject({
+        mode: "read_error",
+        skipDrain: false,
+        preparationFailed: true,
+      });
+    });
+  });
+
+  it("keeps the drain unreachable with the database down and reports the lost run on adoption", async () => {
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: null,
+      processGroupId: null,
+    });
+
+    await withTempPaperclipHome(async (home) => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+      const degraded = heartbeatService(dbFailingOn(db, { op: "select", table: heartbeatRuns }));
+
+      const shutdown = await coordinateHeartbeatSchedulerShutdown({
+        signal: "SIGTERM",
+        prepareHotRestartShutdown: degraded.prepareHotRestartShutdown,
+        waitForHeartbeatSchedulerIdle: vi.fn(async () => undefined),
+        isHotRestartShutdownPending: () => isHotRestartShutdownPending(),
+      });
+
+      expect(shutdown.failClosed).toBe(false);
+      expect(shutdown.hotRestart?.skipDrain).toBe(true);
+
+      // Next boot: the database is back, adoption must not report a clean empty
+      // report for a snapshot that never captured its run list.
+      const heartbeat = heartbeatService(db);
+      const adoption = await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-03-19T00:07:00.000Z"),
+      );
+      expect(adoption.mode).toBe("reported");
+      expect(adoption.adoptedRunIds).toEqual([]);
+      expect(adoption.lostRunIds).toEqual([runId]);
+
+      const report = JSON.parse(
+        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
+      ) as { runs: Array<Record<string, unknown>> };
+      expect(report.runs).toHaveLength(1);
+      expect(report.runs[0]).toMatchObject({
+        runId,
+        classification: "lost",
+        reason: "missing_process_metadata",
+      });
+    });
+  });
+
+  it("defers adoption and keeps the intent when the run table is unreadable on boot", async () => {
+    await seedRunFixture({ agentStatus: "running", processPid: null, processGroupId: null });
+
+    await withTempPaperclipHome(async (home) => {
+      const intent = await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+      await writeHotRestartShutdownSnapshot({
+        intent,
+        signal: "SIGTERM",
+        capturedAt: new Date("2026-03-19T00:06:00.000Z"),
+        activeRuns: [],
+        activeRunsCaptured: false,
+      });
+
+      // The embedded Postgres is often still down when the new server boots, so
+      // the run table is unreadable on the very boot that must reconcile.
+      const heartbeat = heartbeatService(dbFailingOn(db, { op: "select", table: heartbeatRuns }));
+      const adoption = await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-03-19T00:07:00.000Z"),
+      );
+
+      expect(adoption.mode).toBe("deferred");
+      expect(adoption.deferredReason).toBe("run_table_unreadable");
+      expect(adoption.lostRunIds).toEqual([]);
+      // Writing an empty report and deleting the intent here would be the false
+      // all-clear this change exists to prevent.
+      const kept = await readHotRestartIntent();
+      expect(kept?.previousServerPid).toBe(process.pid);
+      expect(kept?.shutdownSnapshot?.activeRunsCaptured).toBe(false);
+      await expect(fs.stat(resolveHotRestartReportPath(home))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    });
+  });
+
+  it("quarantines an unreadable intent instead of failing closed on every future shutdown", async () => {
+    await withTempPaperclipHome(async (home) => {
+      const intentPath = resolveHotRestartIntentPath(home);
+      await fs.mkdir(path.dirname(intentPath), { recursive: true });
+      await fs.writeFile(intentPath, "{ not json", "utf8");
+      // Unreadable intent ⇒ shutdown fails closed.
+      await expect(isHotRestartShutdownPending()).resolves.toBe(true);
+
+      const adoption = await heartbeatService(db).reconcileHotRestartAdoption(
+        new Date("2026-03-19T00:07:00.000Z"),
+      );
+
+      expect(adoption.mode).toBe("read_error");
+      await expect(fs.stat(intentPath)).rejects.toMatchObject({ code: "ENOENT" });
+      const quarantined = (await fs.readdir(path.dirname(intentPath))).filter((entry) =>
+        entry.startsWith("hot-restart-intent.corrupt-"),
+      );
+      expect(quarantined).toHaveLength(1);
+      await expect(
+        fs.readFile(path.join(path.dirname(intentPath), quarantined[0]), "utf8"),
+      ).resolves.toBe("{ not json");
+      // No report: nothing is known about what was running.
+      await expect(fs.stat(resolveHotRestartReportPath(home))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      // ...and the file can no longer suppress the graceful drain forever.
+      await expect(isHotRestartShutdownPending()).resolves.toBe(false);
     });
   });
 
