@@ -4,14 +4,17 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   findMissingHotRestartSnapshotRunIds,
+  isHotRestartShutdownPending,
   isObservedHotRestartTargetAlive,
   parseHotRestartIntent,
+  quarantineHotRestartIntent,
   readHotRestartIntent,
   readProcessStartedAt,
   removeHotRestartIntent,
   resolveHotRestartIntentPath,
   resolveLegacyHotRestartIntentPath,
   writeHotRestartIntent,
+  writeHotRestartShutdownSnapshot,
 } from "./hot-restart.js";
 
 const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
@@ -521,6 +524,7 @@ describe("hot-restart path compatibility", () => {
       shutdownSnapshot: {
         capturedAt: "2026-08-01T04:00:01.000Z",
         signal: "SIGTERM",
+        activeRunsCaptured: true,
         activeRuns: [{
           runId: "captured-run",
           companyId: "company",
@@ -533,5 +537,117 @@ describe("hot-restart path compatibility", () => {
         }],
       },
     })).toEqual(["missing-run"]);
+  });
+});
+
+describe("hot-restart intent capture flag and fail-closed probe", () => {
+  const PID = 4242;
+
+  it("parses a pre-flag snapshot as having captured its run list", () => {
+    expect(
+      parseHotRestartIntent({
+        version: 1,
+        requestedAt: "2026-11-12T11:35:03.000Z",
+        previousServerPid: PID,
+        drainRequired: false,
+        shutdownSnapshot: {
+          capturedAt: "2026-11-12T11:35:04.000Z",
+          signal: "SIGTERM",
+          activeRuns: [],
+        },
+      })?.shutdownSnapshot?.activeRunsCaptured,
+    ).toBe(true);
+  });
+
+  it("round-trips an unknown run list through a write/read cycle", async () => {
+    await withTempHome(async (homeDir) => {
+      const intent = await writeHotRestartIntent({
+        homeDir,
+        previousServerPid: PID,
+        previousServerStartedAt: "2026-11-12T11:34:00.000Z",
+        drainRequired: false,
+      });
+      await writeHotRestartShutdownSnapshot({
+        intent,
+        signal: "SIGTERM",
+        activeRuns: [],
+        activeRunsCaptured: false,
+        homeDir,
+      });
+
+      const reread = await readHotRestartIntent(homeDir);
+      expect(reread?.shutdownSnapshot?.activeRunsCaptured).toBe(false);
+      expect(reread?.shutdownSnapshot?.activeRuns).toEqual([]);
+      expect(reread?.shutdownSnapshot?.signal).toBe("SIGTERM");
+    });
+  });
+
+  it("is pending for an intent that targets this pid without requiring a drain", async () => {
+    await withTempHome(async (homeDir) => {
+      await writeHotRestartIntent({
+        homeDir,
+        previousServerPid: PID,
+        previousServerStartedAt: "2026-11-12T11:34:00.000Z",
+        drainRequired: false,
+      });
+      await expect(isHotRestartShutdownPending({ homeDir, pid: PID })).resolves.toBe(true);
+    });
+  });
+
+  it("is not pending once the intent requires the graceful drain", async () => {
+    await withTempHome(async (homeDir) => {
+      await writeHotRestartIntent({
+        homeDir,
+        previousServerPid: PID,
+        previousServerStartedAt: "2026-11-12T11:34:00.000Z",
+        drainRequired: true,
+      });
+      await expect(isHotRestartShutdownPending({ homeDir, pid: PID })).resolves.toBe(false);
+    });
+  });
+
+  it("is not pending when no intent is on disk", async () => {
+    await withTempHome(async (homeDir) => {
+      await expect(isHotRestartShutdownPending({ homeDir, pid: PID })).resolves.toBe(false);
+    });
+  });
+
+  it("is pending when the intent cannot be parsed", async () => {
+    // Fail closed: a corrupt file must never release a SIGTERM of every live run.
+    await withTempHome(async (homeDir) => {
+      const intentPath = resolveHotRestartIntentPath(homeDir);
+      await fs.mkdir(path.dirname(intentPath), { recursive: true });
+      await fs.writeFile(intentPath, "{ not json", "utf8");
+      await expect(isHotRestartShutdownPending({ homeDir, pid: PID })).resolves.toBe(true);
+    });
+  });
+});
+
+describe("quarantineHotRestartIntent", () => {
+  const PID = 4242;
+
+  it("moves an unreadable intent aside, keeps its bytes and stops it influencing shutdown", async () => {
+    await withTempHome(async (homeDir) => {
+      const source = resolveHotRestartIntentPath(homeDir);
+      await fs.mkdir(path.dirname(source), { recursive: true });
+      await fs.writeFile(source, "{ not json", "utf8");
+
+      const quarantined = await quarantineHotRestartIntent(homeDir);
+
+      expect(quarantined).toBeTruthy();
+      expect(path.basename(quarantined as string)).toMatch(
+        /^hot-restart-intent\.corrupt-.+\.json$/,
+      );
+      await expect(fs.readFile(quarantined as string, "utf8")).resolves.toBe("{ not json");
+      await expect(fs.stat(source)).rejects.toMatchObject({ code: "ENOENT" });
+      // The point of quarantining: the fail-closed probe can no longer see it.
+      await expect(isHotRestartShutdownPending({ homeDir, pid: PID })).resolves.toBe(false);
+    });
+  });
+
+  it("returns null when there is nothing to quarantine", async () => {
+    await withTempHome(async (homeDir) => {
+      await expect(quarantineHotRestartIntent(homeDir)).resolves.toBeNull();
+    });
   });
 });

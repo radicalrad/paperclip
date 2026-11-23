@@ -48,6 +48,14 @@ export type HotRestartIntent = {
     capturedAt: string;
     signal: "SIGINT" | "SIGTERM";
     activeRuns: HotRestartIntentRun[];
+    /**
+     * False when the shutting-down server could not read its run list (for
+     * example because the database connection was already gone). An empty
+     * `activeRuns` with this flag false means "unknown", not "no runs were
+     * running"; the adopting server must classify the live rows instead of
+     * reporting a clean empty adoption.
+     */
+    activeRunsCaptured: boolean;
   };
 };
 
@@ -443,8 +451,10 @@ export function parseHotRestartIntent(value: unknown): HotRestartIntent | null {
   const activeRuns = Array.isArray(snapshot?.activeRuns)
     ? snapshot.activeRuns.map(parseRun).filter((run): run is HotRestartIntentRun => run !== null)
     : [];
+  // Snapshots written before the flag existed always captured the run list.
+  const activeRunsCaptured = snapshot?.activeRunsCaptured !== false;
   if (signal && capturedAt) {
-    intent.shutdownSnapshot = { capturedAt, signal, activeRuns };
+    intent.shutdownSnapshot = { capturedAt, signal, activeRuns, activeRunsCaptured };
   }
 
   return intent;
@@ -550,6 +560,11 @@ export async function writeHotRestartShutdownSnapshot(input: {
   intent: HotRestartIntent;
   signal: "SIGINT" | "SIGTERM";
   activeRuns: HotRestartIntentRun[];
+  /**
+   * Defaults to true. Pass false for the pre-database write that only records
+   * what the shutting-down server already knows without a working database.
+   */
+  activeRunsCaptured?: boolean;
   drainReason?: "active_acp_run";
   drainRunIds?: string[];
   capturedAt?: Date;
@@ -568,6 +583,7 @@ export async function writeHotRestartShutdownSnapshot(input: {
       capturedAt: (input.capturedAt ?? new Date()).toISOString(),
       signal: input.signal,
       activeRuns: input.activeRuns,
+      activeRunsCaptured: input.activeRunsCaptured !== false,
     },
   };
   const instancePath = resolveHotRestartIntentPath(input.homeDir);
@@ -635,9 +651,53 @@ export async function removeHotRestartIntent(homeDir?: string, expected?: HotRes
   );
 }
 
+/**
+ * Move an unreadable intent out of the way so it stops influencing shutdown
+ * decisions, keeping the bytes for post-mortem inspection.
+ *
+ * Required counterpart of "unreadable intent ⇒ fail closed": without it a
+ * corrupt file would suppress the graceful run drain on every shutdown forever.
+ */
+export async function quarantineHotRestartIntent(homeDir?: string) {
+  const source = resolveHotRestartIntentPath(homeDir);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const target = path.join(
+    path.dirname(source),
+    `hot-restart-intent.corrupt-${stamp}.json`,
+  );
+  try {
+    await fs.rename(source, target);
+    return target;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 export function shouldHonorHotRestartIntentForProcess(
   intent: HotRestartIntent,
   pid = process.pid,
 ) {
   return !intent.drainRequired && intent.previousServerPid === pid;
+}
+
+/**
+ * Fail-closed probe for the shutdown coordinator: is a hot restart pending for
+ * this process, i.e. is the graceful run drain forbidden?
+ *
+ * This reads the intent from disk and never touches the database, so it still
+ * answers when the database is already gone — which is exactly the case the
+ * drain used to win. An unreadable intent is treated as "pending": a corrupt
+ * file must not release a SIGTERM of every live run.
+ */
+export async function isHotRestartShutdownPending(input?: {
+  homeDir?: string;
+  pid?: number;
+}) {
+  try {
+    const intent = await readHotRestartIntent(input?.homeDir);
+    return intent ? shouldHonorHotRestartIntentForProcess(intent, input?.pid ?? process.pid) : false;
+  } catch {
+    return true;
+  }
 }

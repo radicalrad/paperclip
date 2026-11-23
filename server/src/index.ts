@@ -226,7 +226,9 @@ import {
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
   runBoundedShutdownStep,
+  shouldSkipHeartbeatRunDrain,
 } from "./shutdown.js";
+import { isHotRestartShutdownPending } from "./services/hot-restart.js";
 import {
   releaseOwnedSettledNativeRunProcessesAtShutdown,
   type ShutdownSettledProcessRelease,
@@ -1832,6 +1834,11 @@ async function startServerWithDatabaseTeardown(
               hotRestart,
               "startup hot-restart adoption reconciliation complete",
             );
+          } else if (hotRestart.mode === "deferred") {
+            logger.error(
+              hotRestart,
+              "startup hot-restart adoption deferred: could not read the run table; intent kept for the next boot and the orphan reaper serves as backstop",
+            );
           }
         } catch (err) {
           logger.error(
@@ -2310,10 +2317,25 @@ async function startServerWithDatabaseTeardown(
       waitForHeartbeatSchedulerIdle: async () => {
         await preDrain.run("scheduler_idle", waitForHeartbeatSchedulerIdle);
       },
+      // Disk-only probe: answers even when the database is already gone.
+      isHotRestartShutdownPending: () => isHotRestartShutdownPending(),
     });
-    const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
+    // One predicate decides the drain, so the fail-closed verdict cannot be
+    // dropped between the coordinator and the shutdown path.
+    const skipHeartbeatDrain = shouldSkipHeartbeatRunDrain(heartbeatShutdown);
     const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
-    if (skipHeartbeatDrain) {
+    if (heartbeatShutdown.failClosed) {
+      logger.error(
+        {
+          err: heartbeatShutdown.preparationError,
+          signal,
+          hotRestart: heartbeatShutdown.hotRestart,
+        },
+        heartbeatShutdown.preparationError
+          ? "hot-restart shutdown preparation failed while an intent is pending; failing closed and leaving live runs alone (graceful run drain skipped)"
+          : "hot restart pending for this pid; failing closed and leaving live runs alone (graceful run drain skipped)",
+      );
+    } else if (skipHeartbeatDrain) {
       logger.info(
         { signal, hotRestart: heartbeatShutdown.hotRestart },
         "hot-restart shutdown prepared after scheduler quiescence; skipping graceful run drain",
@@ -2321,7 +2343,7 @@ async function startServerWithDatabaseTeardown(
     } else if (heartbeatShutdown.preparationError) {
       logger.error(
         { err: heartbeatShutdown.preparationError, signal },
-        "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
+        "hot-restart shutdown preparation failed; no pending hot-restart intent, falling back to graceful heartbeat run drain",
       );
     }
 
